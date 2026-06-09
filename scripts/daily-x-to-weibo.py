@@ -146,6 +146,50 @@ def translate_to_chinese(text, max_tokens=800):
         return text
 
 
+def translate_topics(topics: list) -> list:
+    """把 GitHub topics 翻译/映射成中文标签（用本地字典优先，少量未知再 LLM）。"""
+    # 高频技术 topics 本地映射（避免每次都调 LLM）
+    TOPIC_MAP = {
+        "ai": "AI", "ml": "机器学习", "deep-learning": "深度学习",
+        "machine-learning": "机器学习", "llm": "大模型", "agent": "智能体",
+        "agentic": "智能体", "rag": "RAG", "chatbot": "聊天机器人",
+        "openai": "OpenAI", "anthropic": "Anthropic", "claude": "Claude",
+        "claude-code": "Claude Code", "chatgpt": "ChatGPT", "gpt": "GPT",
+        "framework": "框架", "library": "库", "tool": "工具", "cli": "命令行",
+        "api": "API", "sdk": "SDK", "rest": "REST", "graphql": "GraphQL",
+        "browser": "浏览器", "automation": "自动化", "scraping": "爬虫",
+        "stealth": "反检测", "fingerprint": "指纹",
+        "python": "Python", "javascript": "JavaScript", "typescript": "TypeScript",
+        "rust": "Rust", "go": "Go", "golang": "Go", "java": "Java",
+        "frontend": "前端", "backend": "后端", "fullstack": "全栈",
+        "react": "React", "vue": "Vue", "nextjs": "Next.js",
+        "nodejs": "Node.js", "fastapi": "FastAPI", "django": "Django",
+        "database": "数据库", "postgres": "PostgreSQL", "mysql": "MySQL",
+        "redis": "Redis", "mongodb": "MongoDB", "vector-database": "向量数据库",
+        "search": "搜索", "vector-search": "向量搜索", "embedding": "嵌入",
+        "image": "图像", "video": "视频", "audio": "音频", "voice": "语音",
+        "diffusion": "扩散模型", "stable-diffusion": "Stable Diffusion",
+        "computer-vision": "计算机视觉", "nlp": "自然语言处理",
+        "open-source": "开源", "self-hosted": "自部署",
+        "docker": "Docker", "kubernetes": "K8s", "cloud": "云",
+        "security": "安全", "privacy": "隐私", "encryption": "加密",
+        "compression": "压缩", "performance": "性能", "optimization": "优化",
+        "monitoring": "监控", "logging": "日志", "metrics": "指标",
+        "blockchain": "区块链", "web3": "Web3", "crypto": "加密货币",
+        "game": "游戏", "gamedev": "游戏开发",
+        "education": "教育", "tutorial": "教程", "awesome": "精选",
+        "mcp": "MCP", "prompt-engineering": "提示工程", "fine-tuning": "微调",
+        "tokens": "Tokens", "token-optimization": "Token 优化",
+        "context-window": "上下文窗口", "context-engineering": "上下文工程",
+        "proxy": "代理", "gateway": "网关", "load-balancer": "负载均衡",
+    }
+    result = []
+    for t in topics[:8]:
+        t_lower = t.lower().strip()
+        result.append(TOPIC_MAP.get(t_lower, t))  # 没映射就保留原文
+    return result
+
+
 def _github_headers():
     """构造 GitHub API 请求头，自动注入 token 提升 rate limit。
 
@@ -236,11 +280,12 @@ def fetch_github_repo_info(owner, repo):
             "description": cn_desc or raw_desc,  # 优先中文
             "description_en": raw_desc,           # 保留英文原文
             "homepage": data.get("homepage", ""),
-            "topics": data.get("topics", []),
+            "topics": translate_topics(data.get("topics", [])),  # 翻译/映射成中文标签
+            "topics_en": data.get("topics", []),
             "stars": data.get("stargazers_count", 0),
             "forks": data.get("forks_count", 0),
             "language": data.get("language", ""),
-            "license": data.get("license", {}).get("spdx_id", ""),
+            "license": data.get("license", {}).get("spdx_id", "") if data.get("license") else "",
             "open_issues": data.get("open_issues_count", 0),
             "subscribers": data.get("subscribers_count", 0),
             "readme": cn_readme or raw_readme,     # 优先中文
@@ -626,7 +671,7 @@ if __name__ == "__main__":
     candidates = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
     log(f"📊 去重后候选: {len(candidates)} 个")
 
-    # 筛选规则（满足其一即可入选）
+    # 筛选规则（满足其一即可入选 — 中英文同等门槛，靠翻译保证中文输出）
     def passes_filter(c) -> tuple[bool, str]:
         period = c.get("stars_period", 0)
         total = c.get("stars_total", 0)
@@ -634,21 +679,20 @@ if __name__ == "__main__":
         is_zh = c.get("is_chinese", False)
         source = c["source"]
 
-        # 规则 1: GitHub Trending 当日 stars 增量 >= 500（新项目爆款）
-        if "trending-daily" in source and period >= 500:
-            return True, f"trending-daily +{period}/day"
-        # 规则 2: GitHub Trending 周增量 >= 1000
-        if "trending-weekly" in source and period >= 1000:
-            return True, f"trending-weekly +{period}/week"
-        # 规则 3: 中文项目降低门槛 - 当日 +100 即可
-        if is_zh and "trending" in source and period >= 100:
-            return True, f"chinese-trending +{period}"
-        # 规则 4: Twitter 老规则 - 推文点赞 >= 10K AND GitHub stars >= 10K
-        if source == "twitter" and tweet_likes >= 10000 and total >= 10000:
-            return True, f"twitter-mega likes={tweet_likes}"
-        # 规则 5: Twitter 新爆款 - 24h 推文点赞 >= 1K 且中文
-        if source == "twitter" and tweet_likes >= 1000 and is_zh:
-            return True, f"twitter-chinese-trending likes={tweet_likes}"
+        # 规则 1: GitHub Trending 当日 stars 增量 >= 300（爆款新项目，中英文同等）
+        if "trending-daily" in source and period >= 300:
+            tag = "🇨🇳 " if is_zh else ""
+            return True, f"{tag}trending-daily +{period}/day"
+        # 规则 2: GitHub Trending 周增量 >= 800（中英文同等）
+        if "trending-weekly" in source and period >= 800:
+            tag = "🇨🇳 " if is_zh else ""
+            return True, f"{tag}trending-weekly +{period}/week"
+        # 规则 3: Twitter 推文点赞 >= 5K（任何语言）
+        if source == "twitter" and tweet_likes >= 5000:
+            return True, f"twitter-hot likes={tweet_likes}"
+        # 规则 4: Twitter 中文新爆款（中文社区讨论度）
+        if source == "twitter" and tweet_likes >= 500 and is_zh:
+            return True, f"twitter-chinese likes={tweet_likes}"
         return False, ""
 
     selected = None
