@@ -117,23 +117,28 @@ def translate_to_chinese(text, max_tokens=800):
     """
     # 创建 task-scoped wrapper（复用同一个 task_id）
     task_id = os.environ.get("ACC_TASK_ID", f"weibo-daily-{datetime.now().strftime('%Y-%m-%d-%H')}")
-    wrapper = LLMWrapper(task_id=task_id, provider="evol", model="minimax-m2.7")
 
     system_prompt = (
-        "You are a professional tech translator. Translate the following English text to Chinese (simplified). "
-        "Keep the tone engaging and suitable for a Chinese developer audience. "
-        "Preserve line breaks with \\n. Do NOT add quotes or explanations."
+        "你是专业的科技翻译。把用户提供的英文文本翻译成简体中文，目标读者是中国开发者。"
+        "要求：(1) 准确传达技术含义；(2) 语言地道流畅；(3) 保留 GitHub/AI/LLM 等技术术语；"
+        "(4) 不要添加引号、解释或'翻译：'前缀；(5) 直接输出翻译结果，不要重复原文。"
     )
+
+    wrapper = LLMWrapper(task_id=task_id, provider="evol", model="minimax-m2.7", system_prompt=system_prompt)
 
     try:
         result = wrapper.chat(
-            user_message=f"Translate to Chinese:\n\n{text[:3000]}",
+            user_message=f"请把下面的英文翻译成中文（直接输出中文，不要任何前缀）：\n\n{text[:3000]}",
             max_tokens=max_tokens,
             temperature=0.7,
             metadata={"function": "translate_to_chinese", "text_len": len(text)}
         )
         content = result["content"]
         usage = result["usage"]
+        # 检测翻译失败：返回过短 或 仍无中文
+        if len(content.strip()) < 5 or not any("\u4e00" <= ch <= "\u9fff" for ch in content):
+            log(f"⚠️ 翻译可疑（{len(content)}chars，无中文）: {content[:50]}，使用原文")
+            return text
         log(f"✅ 翻译完成 ({len(content)} chars, {usage['total_tokens']} tokens, ${usage['cost_usd']:.6f})")
         return content.strip()
     except Exception as e:
@@ -141,14 +146,38 @@ def translate_to_chinese(text, max_tokens=800):
         return text
 
 
+def _github_headers():
+    """构造 GitHub API 请求头，自动注入 token 提升 rate limit。
+
+    优先级: GITHUB_TOKEN / GH_TOKEN 环境变量 -> `gh auth token` -> 无认证。
+    无认证: 60 req/h, 认证后: 5000 req/h.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 agent-reach-daily-x-to-weibo",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not token:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["gh", "auth", "token"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                token = result.stdout.strip()
+        except Exception:
+            pass
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def fetch_github_readme(owner, repo):
     """通过 GitHub API 获取 README 内容（前 2000 字）"""
     try:
         api_url = f"https://api.github.com/repos/{owner}/{repo}/readme"
-        req = urllib.request.Request(api_url, headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/vnd.github.v3+json",
-        })
+        req = urllib.request.Request(api_url, headers=_github_headers())
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
         import base64
@@ -163,6 +192,12 @@ def fetch_github_readme(owner, repo):
             content = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', content)
             content = re.sub(r'[#`*_~\[\]]', '', content)
         content = re.sub(r'\n{3,}', '\n\n', content)
+        # 过滤 ASCII art / box drawing 字符（项目 logo 在 README 头部，对中文读者无用）
+        content = re.sub(r'[\u2500-\u259F\u2580-\u259F█▀▄▌▐│─┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬═║╲╱╳]+', '', content)
+        # 删除只剩空白/标点的行
+        lines = [ln for ln in content.split('\n') if ln.strip() and len(re.sub(r'\W', '', ln)) > 2]
+        content = '\n'.join(lines)
+        content = re.sub(r'\n{3,}', '\n\n', content)
         return content[:2000].strip()
     except Exception as e:
         return ""
@@ -172,10 +207,7 @@ def fetch_github_repo_info(owner, repo):
     """通过 GitHub API 获取仓库基本信息，并翻译 description + README 为中文"""
     try:
         api_url = f"https://api.github.com/repos/{owner}/{repo}"
-        req = urllib.request.Request(api_url, headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/vnd.github.v3+json",
-        })
+        req = urllib.request.Request(api_url, headers=_github_headers())
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
 
@@ -480,72 +512,191 @@ if __name__ == "__main__":
         description="Twitter AI 项目 → 微博转发 v3（翻译+截图+发帖）"
     )
 
-    log("=== Daily Twitter AI Project → Weibo v3 ===")
-    
-    # Step 1: 搜索 Twitter 上的 AI GitHub 项目
-    log("Searching Twitter for AI GitHub projects with 10k+ stars...")
+    log("=== Daily Multi-Source AI Project → Weibo v4 ===")
+    log("数据源: GitHub Trending + Twitter | 中文市场优先 | 多规则筛选")
+
+    # ========================================================================
+    # Step 1: 多源候选采集
+    # ========================================================================
+    candidates = []
+
+    # 源 1: GitHub Trending（daily + weekly + 中文）
+    log("📡 Source 1: GitHub Trending (daily/weekly/chinese)...")
+    try:
+        sys.path.insert(0, str(Path.home() / ".agent-reach" / "scripts"))
+        from github_trending import fetch_trending_multi, score_repo, is_chinese_text, save_ranking
+
+        # daily：当日爆款
+        daily = fetch_trending_multi(since="daily")
+        # weekly：本周持续热门
+        weekly = fetch_trending_multi(since="weekly")
+
+        for r in daily:
+            candidates.append({
+                "source": "github-trending-daily",
+                "github_url": r["url"],
+                "owner": r["owner"],
+                "repo": r["repo"],
+                "description": r["description"],
+                "language": r["language"],
+                "stars_period": r["stars_period"],  # today 增量
+                "stars_total": r["stars_total"],
+                "is_chinese": is_chinese_text(r["description"]),
+                "score": r["score"],
+                "tweet": None,
+            })
+        for r in weekly:
+            # weekly 热门补充
+            candidates.append({
+                "source": "github-trending-weekly",
+                "github_url": r["url"],
+                "owner": r["owner"],
+                "repo": r["repo"],
+                "description": r["description"],
+                "language": r["language"],
+                "stars_period": r["stars_period"],  # this week 增量
+                "stars_total": r["stars_total"],
+                "is_chinese": is_chinese_text(r["description"]),
+                "score": r["score"] * 0.7,  # weekly 权重略低于 daily
+                "tweet": None,
+            })
+        log(f"   ✅ Trending: daily={len(daily)}, weekly={len(weekly)}")
+
+        # 持久化每日榜单
+        ranking_path = save_ranking(daily[:20])
+        log(f"   💾 每日 Top 20 榜单已保存: {ranking_path}")
+    except Exception as e:
+        log(f"   ⚠️ GitHub Trending 抓取失败: {e}")
+
+    # 源 2: Twitter 搜索（保留老逻辑作为补充源）
+    log("📡 Source 2: Twitter (AI GitHub keywords)...")
     queries = [
-        "AI GitHub stars:10000",
-        "AI framework open source stars:10000",
-        "AI tool github stars:10000",
+        "AI GitHub stars:1000",
+        "open source AI tool",
+        "github.com agent AI",
     ]
     tweets = []
     for q in queries:
-        tweets = search_twitter(q, limit=10)
-        if tweets:
-            log(f"Query '{q}': got {len(tweets)} results")
-            break
-    
-    if not tweets:
-        log("❌ No Twitter results found")
-        sys.exit(1)
-    
-    # Step 2: 筛选有 GitHub stars >= 10K 且推文点赞数 >= 10K 的项目
-    MIN_TWEET_LIKES = 10000
-    MIN_GITHUB_STARS = 10000
-    selected = None
+        try:
+            tweets = search_twitter(q, limit=20)
+            if tweets:
+                log(f"   Query '{q}': got {len(tweets)} results")
+                break
+        except Exception as e:
+            log(f"   Query '{q}' 失败: {e}")
+
     for tweet in tweets:
         text = tweet.get("text", "")
         url = extract_github_url(text)
+        if not url:
+            continue
+        real_url = expand_shortlink(url)
+        if "github.com/" not in real_url:
+            continue
+        parts = real_url.rstrip("/").replace("https://github.com/", "").split("/")
+        if len(parts) < 2:
+            continue
+        owner, repo = parts[0], parts[1]
         tweet_likes = tweet.get("likeCount", 0)
-        if url and has_github_stars(text, MIN_GITHUB_STARS):
-            # 推文点赞数必须 >= 10K
-            if tweet_likes < MIN_TWEET_LIKES:
-                log(f"⏭️  跳过（GitHub stars OK，但推文点赞 {tweet_likes} < {MIN_TWEET_LIKES}）: {url}")
-                continue
-            real_url = expand_shortlink(url)
-            selected = {
-                "text": text,
-                "github_url": real_url,
-                "author": tweet.get("author", {}).get("screenName", ""),
-                "tweet_id": tweet.get("id", ""),
-                "tweet_obj": tweet,
-                "engagement": {
-                    "likes": tweet_likes,
-                    "retweets": tweet.get("retweetCount", 0),
-                    "replies": tweet.get("replyCount", 0),
-                }
-            }
-            log(f"✅ 选中（推文点赞 {tweet_likes}）: {real_url}")
-            break
-    
+        candidates.append({
+            "source": "twitter",
+            "github_url": real_url,
+            "owner": owner,
+            "repo": repo,
+            "description": text[:200],
+            "language": "",
+            "stars_period": 0,
+            "stars_total": parse_stars(text),
+            "is_chinese": is_chinese_text(text),
+            "score": tweet_likes * 0.5 + (3000 if is_chinese_text(text) else 0),
+            "tweet": tweet,
+            "tweet_likes": tweet_likes,
+        })
+    log(f"   ✅ Twitter: {len([c for c in candidates if c['source']=='twitter'])} 个候选")
+
+    # ========================================================================
+    # Step 2: 去重 + 筛选规则（OR 条件，满足其一即可）
+    # ========================================================================
+    # 去重（按 owner/repo 合并，保留最高分）
+    seen = {}
+    for c in candidates:
+        key = f"{c['owner']}/{c['repo']}"
+        if key not in seen or c["score"] > seen[key]["score"]:
+            seen[key] = c
+    candidates = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+    log(f"📊 去重后候选: {len(candidates)} 个")
+
+    # 筛选规则（满足其一即可入选）
+    def passes_filter(c) -> tuple[bool, str]:
+        period = c.get("stars_period", 0)
+        total = c.get("stars_total", 0)
+        tweet_likes = c.get("tweet_likes", 0)
+        is_zh = c.get("is_chinese", False)
+        source = c["source"]
+
+        # 规则 1: GitHub Trending 当日 stars 增量 >= 500（新项目爆款）
+        if "trending-daily" in source and period >= 500:
+            return True, f"trending-daily +{period}/day"
+        # 规则 2: GitHub Trending 周增量 >= 1000
+        if "trending-weekly" in source and period >= 1000:
+            return True, f"trending-weekly +{period}/week"
+        # 规则 3: 中文项目降低门槛 - 当日 +100 即可
+        if is_zh and "trending" in source and period >= 100:
+            return True, f"chinese-trending +{period}"
+        # 规则 4: Twitter 老规则 - 推文点赞 >= 10K AND GitHub stars >= 10K
+        if source == "twitter" and tweet_likes >= 10000 and total >= 10000:
+            return True, f"twitter-mega likes={tweet_likes}"
+        # 规则 5: Twitter 新爆款 - 24h 推文点赞 >= 1K 且中文
+        if source == "twitter" and tweet_likes >= 1000 and is_zh:
+            return True, f"twitter-chinese-trending likes={tweet_likes}"
+        return False, ""
+
+    selected = None
+    gh_info = {}
+    for c in candidates:
+        passed, reason = passes_filter(c)
+        if not passed:
+            continue
+        zh_mark = "🇨🇳 " if c["is_chinese"] else ""
+        log(f"🎯 候选 [{reason}]: {zh_mark}{c['owner']}/{c['repo']} (score={c['score']:.0f})")
+
+        # 立即验证：抓取 GitHub 详情，如果失败就跳到下一个候选
+        log(f"   Fetching GitHub info: {c['owner']}/{c['repo']}...")
+        info = fetch_github_repo_info(c['owner'], c['repo'])
+        if not info or info.get("stars", 0) == 0:
+            log(f"   ⚠️ GitHub API 失败或仓库无 stars，跳过")
+            continue
+
+        log(f"   ✅ Stars: {info.get('stars')}, Description: {info.get('description', '')[:80]}")
+        gh_info = info
+        selected = {
+            "text": c["description"],
+            "github_url": c["github_url"],
+            "author": c["owner"],
+            "tweet_id": "",
+            "tweet_obj": c.get("tweet") or {},
+            "engagement": {
+                "likes": c.get("tweet_likes", 0),
+                "retweets": (c.get("tweet") or {}).get("retweetCount", 0),
+                "replies": (c.get("tweet") or {}).get("replyCount", 0),
+                "stars_period": c.get("stars_period", 0),
+                "source": c["source"],
+                "filter_reason": reason,
+                "score": c["score"],
+            },
+            "is_chinese_market": c["is_chinese"],
+        }
+        break
+
     if not selected:
-        log(f"❌ No suitable project found (GitHub stars >= {MIN_GITHUB_STARS} AND 推文点赞 >= {MIN_TWEET_LIKES})")
+        log(f"❌ 无符合筛选规则的候选（候选数: {len(candidates)}）")
+        log("筛选规则: trending+500/d | trending-weekly+1000/w | 中文trending+100 | twitter 10K+10K | 中文twitter 1K")
         sys.exit(1)
     
-    # Step 3: 抓取 GitHub 详情
-    gh_info = {}
+    # Step 3: GitHub 详情已在选择循环中获取（gh_info）
     gh_url = selected["github_url"]
-    if "github.com/" in gh_url:
-        parts = gh_url.rstrip("/").replace("https://github.com/", "").split("/")
-        if len(parts) >= 2:
-            owner, repo = parts[0], parts[1]
-            log(f"Fetching GitHub info: {owner}/{repo}...")
-            gh_info = fetch_github_repo_info(owner, repo)
-            log(f"   Stars: {gh_info.get('stars', 'N/A')}")
-            log(f"   Description: {gh_info.get('description', 'N/A')}")
-            log(f"   Topics: {gh_info.get('topics', [])[:5]}")
-            log(f"   README length: {len(gh_info.get('readme', ''))} chars")
+    if gh_info:
+        log(f"📦 GitHub: stars={gh_info.get('stars')}, topics={gh_info.get('topics', [])[:5]}, readme={len(gh_info.get('readme', ''))}chars")
     
     # Step 4: 收集所有图片（推文URL + GitHub本地截图）
     log("Collecting images...")
