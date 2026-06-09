@@ -1,0 +1,23 @@
+# 敏感文件
+config.yaml
+config/weibo_cookie*.txt
+config/*_cookie*.txt
+config/*.key
+config/*.pem
+*.env
+.env*
+
+# 子模块/外部工具（独立维护）
+tools/wechat-article-for-ai/
+tools/xiaoyuzhou/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+scripts/__pycache__/
+
+# 临时输出
+/tmp/
+*.log
+output/
